@@ -1,0 +1,138 @@
+# =========================  数据准备  ======================== #
+
+# 开启代理，方便下载
+source ~/.bashrc
+clashctl on
+
+# 下载数据至数据目录
+python data_load/libero_to_qwen.py \
+    --max-samples 1692 \
+    --output-dir ~/autodl-tmp/data/libero/ \
+    --hf-cache-dir ~/autodl-fs/cache/huggingface \
+    --download-workers 16 \
+    --episode-prefetch 64
+
+# 按照 2:1:1:1 比例生成正负样本
+python data_load/generate_negative_samples.py \
+    --input-dir ~/autodl-tmp/data/libero/packaged \
+    --output-dir ~/autodl-tmp/data/libero/training_data \
+    --seed 42
+
+# 提取关键信息，生成符合VLM输入标准的数据信息
+python data_load/data_process.py \
+    --input-dir ~/autodl-tmp/data/libero/training_data \
+    --output-dir ~/autodl-tmp/data/libero/processed_data_2 
+
+# 将原数据图片转为gif便于查看修改效果
+python data_load/data_process.py \
+    --input-dir ~/autodl-tmp/data/libero/training_data \
+    --output-dir ~/autodl-tmp/data/libero/processed_data_2 \
+    --transcode-dir /root/autodl-tmp/data/libero/processed_data_2 \
+    --limit 50 \
+    --overwrite
+
+
+# 调用Qwen API生成 COT
+python data_load/data_cot_process.py \
+  --input-dir ~/autodl-tmp/data/libero/processed_data \
+  --media-mode video \
+  --model qwen3.5-omni-plus \
+  --max-video-mb 256 \
+  --overwrite
+
+# 准备微调数据
+python data_load/train_dataset_gen.py \
+    --input-dir ~/autodl-tmp/data/libero/processed_data \
+    --output-path ~/autodl-tmp/data/libero/train.jsonl \
+    --val-output-path ~/autodl-tmp/data/libero/val.jsonl \
+    --val-ratio 0.1 \
+    --type-ratios positive=2,visual=1,gripper=1,instruction=1 \
+    --fps 2 \
+    --fps-max-frames 500 \
+    --seed 42
+
+# ============================================================= #
+
+# =========================  环境配置  ======================== #
+conda create -n dfd python=3.10 -y
+conda activate dfd
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+pip install "qwen_vl_utils>=0.0.6" "decord" "bitsandbytes" -U
+pip install -e ./ms-swift         # 使用项目自带的 ms-swift
+pip install -r requirements.txt
+
+# ============================================================= #
+
+# =========================  SFT 微调  ======================== #
+python DFD/SFT_train.py \
+    --model Qwen/Qwen2.5-VL-3B-Instruct \
+    --gpu_ids 0 \
+    --epochs 3\
+    --batch_size 1 \
+    --eval_and_save_steps 50\
+    --lora_rank 8 \
+    --lora_dropout 0.2 \
+    --max_length 4096 \
+    --truncation_strategy left \
+    --quant_bits 8 \
+    --grad_accum 5 \
+    --learning_rate 1e-5 \
+    --max_grad_norm 1.0 \
+    --fps 2 \
+    --fps_max_frames 500 \
+    --video_max_pixels 80200
+
+python DFD/SFT_eval.py \
+  --adapter_path /root/autodl-fs/output/libero/Best \
+  --val_jsonl /root/autodl-tmp/data/libero/val.jsonl \
+  --gpu_ids 0 \
+  --max_new_tokens 256 \
+  --fps 2 \
+  --fps_max_frames 500 \
+  --video_max_pixels 80200
+
+# =========================  可视化展示  ======================== #
+# 单样本测试
+python Visual/test.py \
+    --fps 2\
+    --fps_max_frames 500 \
+    --video /root/autodl-tmp/data/libero/processed_data/episode_000002_visual/videos/main.mp4 \
+    --prompt 
+
+# 训练样本测试
+python Visual/test.py \
+    --fps 5\
+    --fps_max_frames 100 \
+    --adapter_path /root/autodl-fs/output/libero/SFT \
+    --jsonl /root/autodl-tmp/data/libero/train.jsonl \
+    --index 2
+
+# 将视频转为可播放类型
+apt-get update && apt-get install -y ffmpeg
+python Visual/transcode_videos.py
+
+# 交互界面
+python -m streamlit run Visual/surface_streamlit.py \
+    --server.headless true \
+    --server.port 8502
+
+# 前端一
+streamlit run \
+/root/DFD/Visual/demo_frontend.py \
+--server.address 0.0.0.0 \
+--server.port 8501
+
+# 前端二
+streamlit run \
+/root/DFD/Visual/infer_analysis.py \
+--server.address 0.0.0.0 \
+--server.port 8502
+
+# 前端三
+streamlit run \
+/root/DFD/Visual/surface_streamlit.py \
+--server.address 0.0.0.0 \
+--server.port 8503
+
+# 前端
+streamlit run /root/DFD/Visual/app_hub.py --server.address 0.0.0.0 --server.port 8501
